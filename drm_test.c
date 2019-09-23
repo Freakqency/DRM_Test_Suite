@@ -1,17 +1,20 @@
-#define _XOPEN_SOURCE 600
 
 #include <stdio.h>
 #include <sys/ioctl.h>
+#include <err.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <err.h>
 #include <unistd.h>
+
 #include "xf86drm.h"
 #include "xf86drmMode.h"
 
-static const char *dri_path = "/dev/dri/card0";
+static const char dri_path[] = "/dev/dri/card0";
+
+#define WS " \t\n"
 
 enum {
 	DEPTH = 24,
@@ -28,56 +31,47 @@ struct drm_dev_t {
 	struct drm_dev_t *next;
 };
 
-void fatal(char *str)
-{
-	fprintf(stderr, "%s\n", str);
-	exit(EXIT_FAILURE);
-}
-
-void error(char *str)
-{
-	perror(str);
-	exit(EXIT_FAILURE);
-}
-
-int eopen(const char *path, int flag)
+static int
+eopen(const char *path, int flag)
 {
 	int fd;
 
-	if ((fd = open(path, flag)) < 0) {
-		fprintf(stderr, "cannot open \"%s\"\n", path);
-		error("open");
+	if ((fd = open(path, flag)) == -1) {
+		err(EXIT_FAILURE, "cannot open `%s'", path);
 	}
 	return fd;
 }
 
-void *emmap(int addr, size_t len, int prot, int flag, int fd, off_t offset)
+static void *
+emmap(int addr, size_t len, int prot, int flag, int fd, off_t offset)
 {
-	uint32_t *fp;
-
-	if ((fp = (uint32_t *) mmap(0, len, prot, flag, fd, offset)) == MAP_FAILED)
-		error("mmap");
+	void *fp;
+	if ((fp = mmap(0, len, prot, flag, fd, offset)) == MAP_FAILED)
+		err(EXIT_FAILURE, "mmap");
 	return fp;
 }
 
-int drm_open(const char *path)
+static int
+drm_open(const char *path)
 {
 	int fd, flags;
 	uint64_t has_dumb;
 
 	fd = eopen(path, O_RDWR);
 
-	if ((flags = fcntl(fd, F_GETFD)) < 0
-		|| fcntl(fd, F_SETFD, flags | FD_CLOEXEC) < 0)
-		fatal("fcntl FD_CLOEXEC failed");
+	if ((flags = fcntl(fd, F_GETFD)) == -1
+		|| fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == -1)
+		err(EXIT_FAILURE, "fcntl FD_CLOEXEC failed");
 
 	if (drmGetCap(fd, DRM_CAP_DUMB_BUFFER, &has_dumb) < 0 || has_dumb == 0)
-		fatal("drmGetCap DRM_CAP_DUMB_BUFFER failed or doesn't have dumb buffer");
+		err(EXIT_FAILURE, "drmGetCap DRM_CAP_DUMB_BUFFER failed "
+		    "or doesn't have dumb buffer");
 
 	return fd;
 }
 
-struct drm_dev_t *drm_find_dev(int fd)
+static struct drm_dev_t *
+drm_find_dev(int fd)
 {
 	int i;
 	struct drm_dev_t *dev = NULL, *dev_head = NULL;
@@ -86,33 +80,37 @@ struct drm_dev_t *drm_find_dev(int fd)
 	drmModeEncoder *enc;
 
 	if ((res = drmModeGetResources(fd)) == NULL)
-		fatal("drmModeGetResources() failed");
+		err(EXIT_FAILURE, "drmModeGetResources() failed");
 
 	for (i = 0; i < res->count_connectors; i++) {
 		conn = drmModeGetConnector(fd, res->connectors[i]);
 
-		if (conn != NULL && conn->connection == DRM_MODE_CONNECTED && conn->count_modes > 0) {
-			dev = (struct drm_dev_t *) malloc(sizeof(struct drm_dev_t));
-			memset(dev, 0, sizeof(*dev));
-
-			dev->conn_id = conn->connector_id;
-			dev->enc_id = conn->encoder_id;
-			dev->next = NULL;
-
-			memcpy(&dev->mode, &conn->modes[0], sizeof(drmModeModeInfo));
-			dev->width = conn->modes[0].hdisplay;
-			dev->height = conn->modes[0].vdisplay;
-
-			if ((enc = drmModeGetEncoder(fd, dev->enc_id)) == NULL)
-				fatal("drmModeGetEncoder() faild");
-			dev->crtc_id = enc->crtc_id;
-			drmModeFreeEncoder(enc);
-
-			dev->saved_crtc = NULL;
-
-			dev->next = dev_head;
-			dev_head = dev;
+		if (conn == NULL)
+			continue;
+		if (conn->connection != DRM_MODE_CONNECTED
+		    || conn->count_modes <= 0) {
+			drmModeFreeConnector(conn);
+			continue;
 		}
+		dev = calloc(1, sizeof(*dev));
+
+		dev->conn_id = conn->connector_id;
+		dev->enc_id = conn->encoder_id;
+		dev->next = NULL;
+
+		memcpy(&dev->mode, &conn->modes[0], sizeof(dev->mode));
+		dev->width = conn->modes[0].hdisplay;
+		dev->height = conn->modes[0].vdisplay;
+
+		if ((enc = drmModeGetEncoder(fd, dev->enc_id)) == NULL)
+			err(EXIT_FAILURE, "drmModeGetEncoder() faild");
+		dev->crtc_id = enc->crtc_id;
+		drmModeFreeEncoder(enc);
+
+		dev->saved_crtc = NULL;
+
+		dev->next = dev_head;
+		dev_head = dev;
 		drmModeFreeConnector(conn);
 	}
 	drmModeFreeResources(res);
@@ -120,7 +118,8 @@ struct drm_dev_t *drm_find_dev(int fd)
 	return dev_head;
 }
 
-int drm_setup_fb(int fd, struct drm_dev_t *dev)
+static void
+drm_setup_fb(int fd, struct drm_dev_t *dev)
 {
 	struct drm_mode_create_dumb creq;
 	struct drm_mode_map_dumb mreq;
@@ -130,49 +129,49 @@ int drm_setup_fb(int fd, struct drm_dev_t *dev)
 	creq.height = dev->height;
 	creq.bpp = BPP; 
 
-	if (drmIoctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &creq) < 0){
-		fatal("drmIoctl DRM_IOCTL_MODE_CREATE_DUMB failed");
-		return 1;
+	if (drmIoctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &creq) == -1) {
+		err(EXIT_FAILURE, "drmIoctl DRM_IOCTL_MODE_CREATE_DUMB failed");
 	}
 
 	dev->pitch = creq.pitch;
-	dev->size = creq.size;
+	dev->size = (uint32_t) creq.size;
 	dev->handle = creq.handle;
 
 	if (drmModeAddFB(fd, dev->width, dev->height,
-		DEPTH, BPP, dev->pitch, dev->handle, &dev->fb_id)){
-		fatal("drmModeAddFB failed");
-		return 1;
+	    DEPTH, BPP, dev->pitch, dev->handle, &dev->fb_id)){
+		err(EXIT_FAILURE, "drmModeAddFB failed");
 	}
 
 	memset(&mreq, 0, sizeof(mreq));
 	mreq.handle = dev->handle;
 
-	if (drmIoctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &mreq)){
-		fatal("drmIoctl DRM_IOCTL_MODE_MAP_DUMB failed");
-		return 1;
+	if (drmIoctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &mreq) == -1) {
+		err(EXIT_FAILURE, "drmIoctl DRM_IOCTL_MODE_MAP_DUMB failed");
 	}
 
-	dev->buf = (uint32_t *) emmap(0, dev->size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, mreq.offset);
+	dev->buf = emmap(0, dev->size, PROT_READ | PROT_WRITE, MAP_SHARED,
+	    fd, (off_t)mreq.offset);
 
 	dev->saved_crtc = drmModeGetCrtc(fd, dev->crtc_id); 
-	if (drmModeSetCrtc(fd, dev->crtc_id, dev->fb_id, 0, 0, &dev->conn_id, 1, &dev->mode)){
-		fatal("drmModeSetCrtc() failed");
-		return 1;
+	if (drmModeSetCrtc(fd, dev->crtc_id, dev->fb_id, 0, 0, &dev->conn_id,
+	    1, &dev->mode)) {
+		err(EXIT_FAILURE, "drmModeSetCrtc() failed");
 	}
-
-	return 0;
 }
 
-int drm_destroy(int fd, struct drm_dev_t *dev_head)
+static void
+drm_destroy(int fd, struct drm_dev_t *dev_head)
 {
 	struct drm_dev_t *devp, *devp_tmp;
 	struct drm_mode_destroy_dumb dreq;
 
 	for (devp = dev_head; devp != NULL;) {
-		if (devp->saved_crtc)
-			drmModeSetCrtc(fd, devp->saved_crtc->crtc_id, devp->saved_crtc->buffer_id,
-				devp->saved_crtc->x, devp->saved_crtc->y, &devp->conn_id, 1, &devp->saved_crtc->mode);
+		if (devp->saved_crtc) {
+			drmModeSetCrtc(fd, devp->saved_crtc->crtc_id,
+			    devp->saved_crtc->buffer_id, devp->saved_crtc->x,
+			    devp->saved_crtc->y, &devp->conn_id, 1,
+			    &devp->saved_crtc->mode);
+		}
 		drmModeFreeCrtc(devp->saved_crtc);
 
 		munmap(devp->buf, devp->size);
@@ -189,38 +188,73 @@ int drm_destroy(int fd, struct drm_dev_t *dev_head)
 	}
 
 	close(fd);
-	return 0;
 }
 
-void drm_ioctl_version(int fd){
+static void
+drm_ioctl_version(int fd)
+{
 	struct drm_version vers;
 
 	if (ioctl(fd, DRM_IOCTL_VERSION, &vers) == -1)
-		warn("drm_ioctl_version");
+		warn("DRM_IOCTL_VERSION");
 
-	printf("Version_major:%d,Version_minor:%d,Version_patchlevel:%d,Name_len:%d,\n", vers.version_major, vers.version_minor, vers.version_patchlevel, vers.name_len);
-	printf("Struct Members :Version_major, Version_minor, Patchlevel, Name_len, Date_len, Desc_len\n");
+	printf("DRM_IOCTL_VERSION: version_major: %d, "
+	    "version_minor: %d, "
+	    "version_patchlevel: %d, "
+	    "name_len: %zu\n",
+	    vers.version_major,
+	    vers.version_minor,
+	    vers.version_patchlevel,
+	    vers.name_len);
 }
 
-void drm_ioctl_get_unique(int fd){
+static void
+drm_ioctl_get_unique(int fd)
+{
 	struct drm_unique unique;
 	if (ioctl(fd, DRM_IOCTL_GET_UNIQUE, &unique) == -1)
-		warn("error");
+		warn("DRM_IOCTL_GET_UNIQUE");
 	
-	printf("unique_len:%d,unique:%s", unique.unique_len, unique.unique);
-	printf("Struct members Unique_len,unique\n");
+	printf("DRM_IOCTL_GET_UNIQUE: unique_len: %zu, "
+	    "unique: %s\n", unique.unique_len, unique.unique);
 }
 
-void drm_ioctl_set_unique(int fd){
+static void
+drm_ioctl_set_unique(int fd)
+{
 	struct drm_unique unique;
-	if (ioctl(fd, DRM_IOCTL_SET_UNIQUE, &unique) == -1)
-		warn("error");
 
-	printf("unique_len:%d,unique:%s", unique.unique_len, unique.unique);
-	printf("Struct members: Unique_len,unique\n");
+	memset(&unique, 0, sizeof(unique));
+
+	const char *len = strtok(NULL, WS);
+	if (len == NULL) {
+		warnx("set_unique: Missing length\n");
+		return;
+	}
+
+	const char *ptr = strtok(NULL, WS);
+	if (ptr == NULL) {
+		warnx("set_unique: Missing unique\n");
+		return;
+	}
+
+	unique.unique_len = strtoul(len, NULL, 0);
+	if (unique.unique_len >= sizeof(unique.unique)) {
+		warnx("set_unique: bad length %zu\n", unique.unique_len);
+		return;
+	}
+	memcpy(unique.unique, ptr, unique.unique_len);
+
+	if (ioctl(fd, DRM_IOCTL_SET_UNIQUE, &unique) == -1)
+		warn("DRM_IOCTL_SET_UNIQUE");
+
+	printf("DRM_IOCTL_SET_UNIQUE: unique_len: %zu, unique: %s\n",
+	    unique.unique_len, unique.unique);
 }
 
-void drm_ioctl_get_map(int fd){
+// XXX: Fixed up to there.
+static void
+drm_ioctl_get_map(int fd){
 	struct drm_map map;
 	if (ioctl(fd, DRM_IOCTL_GET_MAP, &map) == -1)
 		warn("error");
@@ -229,7 +263,8 @@ void drm_ioctl_get_map(int fd){
 	printf("Struct members: offset,size:,type,map_flag,handle,mtrr\n");
 }
 
-void drm_ioctl_add_map(int fd){
+static void
+drm_ioctl_add_map(int fd){
 	struct drm_map map;
 	if (ioctl(fd, DRM_IOCTL_ADD_MAP, &map) == -1)
 		warn("error");
@@ -238,7 +273,8 @@ void drm_ioctl_add_map(int fd){
 	printf("Struct members: offset,size,map_type,map_flag,handle,mtrr\n");
 }
 
-void drm_ioctl_rm_map(int fd){
+static void
+drm_ioctl_rm_map(int fd){
 	struct drm_map map;
 	if (ioctl(fd, DRM_IOCTL_RM_MAP, &map) == -1)
 		warn("error");
@@ -247,7 +283,8 @@ void drm_ioctl_rm_map(int fd){
 	printf("Struct members: offset,size,map_type,map_flag,handle,mtrr\n");
 }
 
-void drm_ioctl_get_client(int fd){
+static void
+drm_ioctl_get_client(int fd){
 	struct drm_client client;
 	if (ioctl(fd, DRM_IOCTL_GET_CLIENT, &client) == -1)
 		warn("error");
@@ -256,7 +293,8 @@ void drm_ioctl_get_client(int fd){
 	printf("Struct members: idx,auth,pid,uid,magic,iocs\n");
 }
 
-void drm_ioctl_get_stats(int fd){
+static void
+drm_ioctl_get_stats(int fd){
 	struct drm_stats stats;
 	if (ioctl(fd, DRM_IOCTL_GET_STATS, &stats) == -1)
 		warn("error");
@@ -265,7 +303,8 @@ void drm_ioctl_get_stats(int fd){
 	printf("Struct members: count\n");
 }
 
-void drm_ioctl_add_bufs(int fd){
+static void
+drm_ioctl_add_bufs(int fd){
 	struct drm_buf_desc desc;
 
 	if (ioctl(fd, DRM_IOCTL_ADD_BUFS, &desc) == -1)
@@ -275,7 +314,8 @@ void drm_ioctl_add_bufs(int fd){
 	printf("Struct members: count,size,low_mark,high_mark,flags,agp_start\n");
 }
 
-void drm_ioctl_mark_bufs(int fd){
+static void
+drm_ioctl_mark_bufs(int fd){
 	struct drm_buf_desc desc;
 	if (ioctl(fd, DRM_IOCTL_MARK_BUFS, &desc) == -1)
 		warn ("error");
@@ -284,7 +324,8 @@ void drm_ioctl_mark_bufs(int fd){
 	printf("Struct members: count,size,low_mark,high_mark,flags,agp_start\n");
 }
 
-void drm_ioctl_free_bufs(int fd){
+static void
+drm_ioctl_free_bufs(int fd){
 	struct drm_buf_desc desc;
 	if (ioctl(fd, DRM_IOCTL_FREE_BUFS, &desc) == -1)
 		warn("error");
@@ -293,7 +334,8 @@ void drm_ioctl_free_bufs(int fd){
 	printf("Struct members: count,size,low_mark,high_mark,flags,agp_start\n");
 }
 
-void drm_ioctl_set_sarea_ctx(int fd){
+static void
+drm_ioctl_set_sarea_ctx(int fd){
 	struct drm_ctx_priv_map sarea;
 
 	if (ioctl(fd, DRM_IOCTL_SET_SAREA_CTX, &sarea) == -1)
@@ -303,7 +345,8 @@ void drm_ioctl_set_sarea_ctx(int fd){
 	printf("Struct members: ctx_id,handle\n");
 }
 
-void drm_ioctl_get_sarea_ctx(int fd){
+static void
+drm_ioctl_get_sarea_ctx(int fd){
 	struct drm_ctx_priv_map sarea;
 
 	if (ioctl(fd, DRM_IOCTL_GET_SAREA_CTX, &sarea) == -1)
@@ -313,7 +356,8 @@ void drm_ioctl_get_sarea_ctx(int fd){
 	printf("Struct members: ctx_id,handle\n");
 }
 
-void drm_ioctl_res_ctx(int fd){
+static void
+drm_ioctl_res_ctx(int fd){
 	struct drm_ctx_res res;
 	if (ioctl(fd, DRM_IOCTL_RES_CTX, &res) == -1)
 		warn("error");
@@ -322,7 +366,8 @@ void drm_ioctl_res_ctx(int fd){
 	printf("Struct members: count\n");
 }
 
-void drm_ioctl_dma(int fd){
+static void
+drm_ioctl_dma(int fd){
 	struct drm_dma dma;
 	if (ioctl(fd, DRM_IOCTL_DMA, &dma) == -1)
 		warn("error");
@@ -331,7 +376,8 @@ void drm_ioctl_dma(int fd){
 	printf("Struct members: context\n");
 }
 
-void drm_ioctl_agp_enable(int fd){
+static void
+drm_ioctl_agp_enable(int fd){
 	struct drm_agp_mode agp;
 	if (ioctl(fd, DRM_IOCTL_AGP_ENABLE, &agp) == -1)
 		warn("error");
@@ -340,7 +386,8 @@ void drm_ioctl_agp_enable(int fd){
 	printf("Struct members: mode\n");
 }
 
-void drm_ioctl_agp_info(int fd){
+static void
+drm_ioctl_agp_info(int fd){
 	struct drm_agp_info agp_info;
 	if (ioctl(fd, DRM_IOCTL_AGP_INFO, &agp_info) == -1)
 		warn("error");
@@ -349,7 +396,8 @@ void drm_ioctl_agp_info(int fd){
 	printf("Struct members: agp_version_major\n");
 }
 
-void drm_ioctl_agp_alloc(int fd){
+static void
+drm_ioctl_agp_alloc(int fd){
 	struct drm_agp_buffer agp_buffer;
 	if (ioctl(fd, DRM_IOCTL_AGP_ALLOC, &agp_buffer) == -1)
 		warn("error");
@@ -358,7 +406,8 @@ void drm_ioctl_agp_alloc(int fd){
 	printf("Struct membersagp_buffer_size, agp_buffer_handle, agp_buffer_type, agp_buffer_physical\n");
 }
 
-void drm_ioctl_agp_free(int fd){
+static void
+drm_ioctl_agp_free(int fd){
 	struct drm_agp_buffer agp_buffer;
 	if (ioctl(fd, DRM_IOCTL_AGP_FREE, &agp_buffer) == -1)
 		warn("error");
@@ -367,7 +416,8 @@ void drm_ioctl_agp_free(int fd){
 	printf("Struct members: agp_buffer_size, agp_buffer_handle, agp_buffer_type, agp_buffer_physical\n");
 }
 
-void drm_ioctl_agp_bind(int fd){
+static void
+drm_ioctl_agp_bind(int fd){
 	struct drm_agp_binding agp_bind;
 	if (ioctl(fd, DRM_IOCTL_AGP_BIND, &agp_bind) == -1)
 		warn("error");
@@ -376,7 +426,8 @@ void drm_ioctl_agp_bind(int fd){
 	printf("Struct members: agp_bind_handle, agp_bind_offset\n");
 }
 
-void drm_ioctl_agp_unbind(int fd){
+static void
+drm_ioctl_agp_unbind(int fd){
 	struct drm_agp_binding agp_unbind;
 	if (ioctl(fd, DRM_IOCTL_AGP_UNBIND, &agp_unbind) == -1)
 		warn("error");
@@ -385,7 +436,8 @@ void drm_ioctl_agp_unbind(int fd){
 	printf("Struct members: agp_bind_handle, agp_bind_offset\n");
 }
 
-void drm_ioctl_sg_alloc(int fd){
+static void
+drm_ioctl_sg_alloc(int fd){
 	struct drm_scatter_gather sg;
 	if (ioctl(fd, DRM_IOCTL_SG_ALLOC, &sg) == -1)
 		warn("error");
@@ -394,7 +446,8 @@ void drm_ioctl_sg_alloc(int fd){
 	printf("Struct members: sg_size, sg_handle");
 }
 
-void drm_ioctl_sg_free(int fd){
+static void
+drm_ioctl_sg_free(int fd){
 	struct drm_scatter_gather sg;
 	if (ioctl(fd, DRM_IOCTL_SG_FREE, &sg) == -1)
 		warn("error");
@@ -403,7 +456,8 @@ void drm_ioctl_sg_free(int fd){
 	printf("Struct members: sg_size, sg_handle");
 }
 
-void drm_ioctl_update_draw(int fd){
+static void
+drm_ioctl_update_draw(int fd){
 	struct drm_update_draw update_draw;
 	if (ioctl(fd, DRM_IOCTL_UPDATE_DRAW, &update_draw) == -1)
 		warn("error");
@@ -413,7 +467,8 @@ void drm_ioctl_update_draw(int fd){
 
 }
 
-void drm_ioctl_wait_vblank(int fd){
+static void
+drm_ioctl_wait_vblank(int fd){
 	union drm_wait_vblank vblank;
 	if (ioctl(fd, DRM_IOCTL_WAIT_VBLANK, &vblank) == -1)
 		warn("error");
@@ -422,52 +477,53 @@ void drm_ioctl_wait_vblank(int fd){
 	printf("Struct members: vblank_request_sequence, vblank_request_signal, vblank_reply_sequence");
 }
 
-void drm_ioctl_addfb2(int fd){
+static void
+drm_ioctl_addfb2(int fd){
 	struct drm_mode_fb_cmd2 addfb2;
 	if (ioctl(fd, DRM_IOCTL_MODE_ADDFB2, &addfb2) == -1)
 		warn("error");
 
 	printf("fb_id:%d, width:%d, height:%d, pixel_format:%d, flags:%d", addfb2.fb_id, addfb2.width, addfb2.height, addfb2.pixel_format, addfb2.flags);
+#ifdef notyet
 	for(int i = 0; i < 4; i++)
 	       printf("handles:%d, pitches:%d, offsets:%d, modifiers:%lld", addfb2.handles[i], addfb2.pitches[i], addfb2.offsets[i], addfb2.modifier[i]);
 	printf("Struct members: fb_id, width, height, pixel_format, flags, handles, pitches, offsets, modifiers");	
+#endif
 }
 
-struct {
+static struct {
 	const char* name;
 	void (*func)(int);
-}cmd[] = {
-	{"version", drm_ioctl_version},
-	{"get_unique", drm_ioctl_get_unique},
-	{"set_unique", drm_ioctl_set_unique},
-	{"get_map", drm_ioctl_get_map},
-	{"add_map", drm_ioctl_add_map},
-	{"rm_map", drm_ioctl_rm_map},
-	{"get_client", drm_ioctl_get_client},
-	{"get_stats", drm_ioctl_get_stats},
-	{"add_bufs", drm_ioctl_add_bufs},
-	{"mark_bufs", drm_ioctl_mark_bufs},
-	{"free_bufs", drm_ioctl_free_bufs},
-	{"set_sarea", drm_ioctl_set_sarea_ctx},
-	{"get_sarea", drm_ioctl_get_sarea_ctx},
-	{"res_ctx", drm_ioctl_res_ctx},
-	{"dma", drm_ioctl_dma},
-	{"agp_enable", drm_ioctl_agp_enable},
-	{"agp_info", drm_ioctl_agp_info},
-	{"agp_alloc", drm_ioctl_agp_alloc},
-	{"agp_free", drm_ioctl_agp_free},
-	{"agp_bind", drm_ioctl_agp_bind},
-	{"agp_unbind", drm_ioctl_agp_unbind},
-	{"sg_alloc", drm_ioctl_sg_alloc},
-	{"sg_free", drm_ioctl_sg_free},
-	{"update_draw", drm_ioctl_update_draw},
-	{"wait_vblank", drm_ioctl_wait_vblank},
-	{"mode_addfb2", drm_ioctl_addfb2}
-
-
+} cmd[] = {
+	{ "version",		drm_ioctl_version },
+	{ "get_unique",		drm_ioctl_get_unique },
+	{ "set_unique",		drm_ioctl_set_unique },
+	{ "get_map",		drm_ioctl_get_map },
+	{ "add_map",		drm_ioctl_add_map },
+	{ "rm_map",		drm_ioctl_rm_map },
+	{ "get_client",		drm_ioctl_get_client },
+	{ "get_stats",		drm_ioctl_get_stats },
+	{ "add_bufs",		drm_ioctl_add_bufs },
+	{ "mark_bufs",		drm_ioctl_mark_bufs },
+	{ "free_bufs",		drm_ioctl_free_bufs },
+	{ "set_sarea",		drm_ioctl_set_sarea_ctx },
+	{ "get_sarea",		drm_ioctl_get_sarea_ctx },
+	{ "res_ctx",		drm_ioctl_res_ctx },
+	{ "dma",		drm_ioctl_dma },
+	{ "agp_enable",		drm_ioctl_agp_enable },
+	{ "agp_info",		drm_ioctl_agp_info },
+	{ "agp_alloc",		drm_ioctl_agp_alloc },
+	{ "agp_free",		drm_ioctl_agp_free },
+	{ "agp_bind",		drm_ioctl_agp_bind },
+	{ "agp_unbind",		drm_ioctl_agp_unbind },
+	{ "sg_alloc",		drm_ioctl_sg_alloc },
+	{ "sg_free",		drm_ioctl_sg_free },
+	{ "update_draw",	drm_ioctl_update_draw },
+	{ "wait_vblank",	drm_ioctl_wait_vblank },
+	{ "mode_addfb2",	drm_ioctl_addfb2 }
 };
 
-int main()
+int main(void)
 {
 	int fd;
 	struct drm_dev_t *dev_head, *dev;
@@ -476,28 +532,35 @@ int main()
 	dev_head = drm_find_dev(fd);
 
 	if (dev_head == NULL) {
-		fprintf(stderr, "available drm_dev not found\n");
-		return EXIT_FAILURE;
+		err(EXIT_FAILURE, "Available drm_dev not found\n");
 	}
 
 	dev = dev_head;
 	drm_setup_fb(fd, dev);
 
-	char name[100];
-	printf("Enter the operation to perform:");
-	scanf("%s", name);
-
-	size_t i;
-	for (i = 0;i < __arraycount(cmd);i++){
-		if (strcmp(cmd[i].name,name) == 0){
-			(*cmd[i].func)(fd);
+	char line[1024];
+	for (;;) {
+		printf("Enter the operation to perform:");
+		if (fgets(line, sizeof(line), stdin) == NULL)
 			break;
+
+		char *name = strtok(line, WS);
+		if (name == NULL)
+			continue;
+
+		size_t i;
+		for (i = 0; i < __arraycount(cmd);i++) {
+			if (strcmp(cmd[i].name, name) == 0) {
+				(*cmd[i].func)(fd);
+				break;
+			}
+		}
+		if (i == __arraycount(cmd)) {
+			warnx("unknown cmd %s", name);
+			continue;
 		}
 	}
-	if (i == __arraycount(cmd))
-	       warn("unknown cmd %s",name);
 
-	sleep(3);
 	drm_destroy(fd, dev_head);
-	return 0;
+	return EXIT_SUCCESS;
 }
